@@ -1,0 +1,96 @@
+name: Mirror upstream release
+
+on:
+  workflow_run:
+    workflows: ["Sync upstream"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPO: storytold/photocraft
+      FORK_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Mirror latest upstream release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "$work_dir"' EXIT
+
+          gh api "repos/$UPSTREAM_REPO/releases/latest" > "$work_dir/upstream.json"
+          tag="$(jq -r '.tag_name' "$work_dir/upstream.json")"
+          title="$(jq -r '.name // .tag_name' "$work_dir/upstream.json")"
+          jq -r '.body // ""' "$work_dir/upstream.json" > "$work_dir/notes.md"
+
+          if ! gh release view "$tag" --repo "$FORK_REPO" > /dev/null 2>&1; then
+            tag_ref="$(gh api "repos/$UPSTREAM_REPO/git/ref/tags/$tag")"
+            target="$(jq -r '.object.sha' <<< "$tag_ref")"
+
+            if [[ "$(jq -r '.object.type' <<< "$tag_ref")" == "tag" ]]; then
+              target="$(gh api "repos/$UPSTREAM_REPO/git/tags/$target" --jq '.object.sha')"
+            fi
+
+            release_options=(
+              --repo "$FORK_REPO"
+              --target "$target"
+              --title "$title"
+              --notes-file "$work_dir/notes.md"
+            )
+            if jq -e '.prerelease' "$work_dir/upstream.json" > /dev/null; then
+              release_options+=(--prerelease)
+            fi
+
+            gh release create "$tag" "${release_options[@]}"
+          fi
+
+          gh api "repos/$FORK_REPO/releases/tags/$tag" > "$work_dir/fork.json"
+
+          jq -c '.assets[] | {name, size, digest}' "$work_dir/upstream.json" |
+          while IFS= read -r asset; do
+            name="$(jq -r '.name' <<< "$asset")"
+            size="$(jq -r '.size' <<< "$asset")"
+            digest="$(jq -r '.digest // ""' <<< "$asset")"
+
+            existing="$(jq -c --arg name "$name"               '[.assets[] | select(.name == $name)] | first // {}' "$work_dir/fork.json")"
+            existing_size="$(jq -r '.size // -1' <<< "$existing")"
+            existing_digest="$(jq -r '.digest // ""' <<< "$existing")"
+
+            if [[ "$size" == "$existing_size" ]] &&
+               { [[ -z "$digest" || -z "$existing_digest" ]] ||
+                 [[ "$digest" == "$existing_digest" ]]; }; then
+              echo "Already mirrored: $name"
+              continue
+            fi
+
+            echo "Mirroring: $name"
+            gh release download "$tag" --repo "$UPSTREAM_REPO"               --pattern "$name" --dir "$work_dir"
+
+            if [[ "$digest" == sha256:* ]]; then
+              actual="$(sha256sum "$work_dir/$name" | cut -d ' ' -f 1)"
+              if [[ "$actual" != "${digest#sha256:}" ]]; then
+                echo "SHA-256 mismatch: $name" >&2
+                exit 1
+              fi
+            fi
+
+            gh release upload "$tag" "$work_dir/$name"               --repo "$FORK_REPO" --clobber
+            rm -f -- "$work_dir/$name"
+          done
