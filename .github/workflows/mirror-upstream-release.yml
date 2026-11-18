@@ -22,7 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      GH_TOKEN: ${{ github.token }}
+      # Use the same workflow-capable token as the upstream sync job.
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
       UPSTREAM_REPO: storytold/photocraft
       FORK_REPO: ${{ github.repository }}
 
